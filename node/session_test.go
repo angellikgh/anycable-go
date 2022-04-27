@@ -7,6 +7,7 @@ import (
 	"github.com/anycable/anycable-go/common"
 	"github.com/anycable/anycable-go/ws"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSendRaceConditions(t *testing.T) {
@@ -142,4 +143,125 @@ func TestMergeEnv(t *testing.T) {
 	assert.Equal(t, "baz", origEnv.GetChannelStateField("test_channel", "foo"))
 	assert.Equal(t, "z", origEnv.GetChannelStateField("test_channel", "a"))
 	assert.Equal(t, "time", origEnv.GetChannelStateField("another_channel", "wasting"))
+}
+
+func TestSubscriptionStateChannels(t *testing.T) {
+	t.Run("with different channels", func(t *testing.T) {
+		subscriptions := NewSubscriptionState()
+
+		subscriptions.AddChannel("{\"channel\":\"SystemNotificationChannel\"}")
+		subscriptions.AddChannel("{\"channel\":\"DressageChannel\",\"id\":23376}")
+
+		expected := []string{
+			"{\"channel\":\"SystemNotificationChannel\"}",
+			"{\"channel\":\"DressageChannel\",\"id\":23376}",
+		}
+
+		actual := subscriptions.Channels()
+
+		for _, key := range expected {
+			assert.Contains(t, actual, key)
+		}
+	})
+
+	t.Run("with the same channel", func(t *testing.T) {
+		subscriptions := NewSubscriptionState()
+
+		subscriptions.AddChannel(
+			"{\"channel\":\"GraphqlChannel\",\"channelId\":\"165d8949069\"}",
+		)
+		subscriptions.AddChannel(
+			"{\"channel\":\"GraphqlChannel\",\"channelId\":\"165d8941e62\"}",
+		)
+
+		expected := []string{
+			"{\"channel\":\"GraphqlChannel\",\"channelId\":\"165d8949069\"}",
+			"{\"channel\":\"GraphqlChannel\",\"channelId\":\"165d8941e62\"}",
+		}
+
+		actual := subscriptions.Channels()
+
+		for _, key := range expected {
+			assert.Contains(t, actual, key)
+		}
+	})
+}
+
+func TestSubscriptionStreamsFor(t *testing.T) {
+	subscriptions := NewSubscriptionState()
+
+	subscriptions.AddChannel("chat_1")
+	subscriptions.AddChannel("presence_1")
+
+	subscriptions.AddChannelStream("chat_1", "a")
+	subscriptions.AddChannelStream("chat_1", "b")
+	subscriptions.AddChannelStream("presence_1", "z")
+
+	assert.Contains(t, subscriptions.StreamsFor("chat_1"), "a")
+	assert.Contains(t, subscriptions.StreamsFor("chat_1"), "b")
+	assert.Equal(t, []string{"z"}, subscriptions.StreamsFor("presence_1"))
+
+	subscriptions.RemoveChannelStreams("chat_1")
+	assert.Empty(t, subscriptions.StreamsFor("chat_1"))
+	assert.Equal(t, []string{"z"}, subscriptions.StreamsFor("presence_1"))
+
+	subscriptions.AddChannelStream("presence_1", "y")
+	subscriptions.RemoveChannelStream("presence_1", "z")
+	subscriptions.RemoveChannelStream("presence_1", "t")
+	assert.Equal(t, []string{"y"}, subscriptions.StreamsFor("presence_1"))
+}
+
+func TestCacheEntry(t *testing.T) {
+	session := Session{}
+
+	session.subscriptions = NewSubscriptionState()
+	session.subscriptions.AddChannel("chat_1")
+	session.subscriptions.AddChannel("presence_1")
+
+	session.subscriptions.AddChannelStream("chat_1", "a")
+	session.subscriptions.AddChannelStream("chat_1", "b")
+	session.subscriptions.AddChannelStream("presence_1", "z")
+
+	session.env = common.NewSessionEnv("/cable", nil)
+	session.SetIdentifiers("plastilin")
+	session.env.MergeConnectionState(&map[string]string{"tenant": "x", "locale": "it"})
+	session.env.MergeChannelState("chat_1", &map[string]string{"presence": "on"})
+
+	cached, err := session.ToCacheEntry()
+	require.NoError(t, err)
+
+	new_session := Session{}
+	new_session.subscriptions = NewSubscriptionState()
+	new_session.env = common.NewSessionEnv("/cable", nil)
+
+	err = new_session.RestoreFromCache(cached)
+	require.NoError(t, err)
+
+	assert.Equal(t, "plastilin", new_session.GetIdentifiers())
+
+	assert.Contains(t, new_session.subscriptions.Channels(), "chat_1")
+	assert.Contains(t, new_session.subscriptions.Channels(), "presence_1")
+	assert.Contains(t, new_session.subscriptions.StreamsFor("chat_1"), "a")
+	assert.Contains(t, new_session.subscriptions.StreamsFor("chat_1"), "b")
+	assert.Contains(t, new_session.subscriptions.StreamsFor("presence_1"), "z")
+
+	assert.Equal(t, "x", new_session.env.GetConnectionStateField("tenant"))
+	assert.Equal(t, "it", new_session.env.GetConnectionStateField("locale"))
+	assert.Equal(t, "on", new_session.env.GetChannelStateField("chat_1", "presence"))
+}
+
+func TestCacheEntryEmptySession(t *testing.T) {
+	session := Session{}
+	session.subscriptions = NewSubscriptionState()
+	session.env = common.NewSessionEnv("/cable", nil)
+
+	cached, err := session.ToCacheEntry()
+	require.NoError(t, err)
+
+	new_session := Session{}
+	new_session.subscriptions = NewSubscriptionState()
+	new_session.env = common.NewSessionEnv("/cable", nil)
+
+	err = new_session.RestoreFromCache(cached)
+	require.NoError(t, err)
 }
