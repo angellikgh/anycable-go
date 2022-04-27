@@ -21,15 +21,23 @@ const (
 	DisconnectType = "disconnect"
 	ConfirmedType  = "confirm_subscription"
 	RejectedType   = "reject_subscription"
-	// Not suppurted by Action Cable currently
+	// Not supported by Action Cable currently
 	UnsubscribedType = "unsubscribed"
 )
 
+// Disconnect reasons
+const (
+	SERVER_RESTART_REASON    = "server_restart"
+	REMOTE_DISCONNECT_REASON = "remote"
+)
+
 // SessionEnv represents the underlying HTTP connection data:
-// URL and request headers
+// URL and request headers.
+// It also carries channel and connection state information used by the RPC app.
 type SessionEnv struct {
 	URL             string
 	Headers         *map[string]string
+	Identifiers     string
 	ConnectionState *map[string]string
 	ChannelStates   *map[string]map[string]string
 }
@@ -165,17 +173,65 @@ func (c *CommandResult) ToCallResult() *CallResult {
 	return &res
 }
 
+type HistoryPosition struct {
+	Epoch  string `json:"epoch"`
+	Offset uint64 `json:"offset"`
+}
+
+// HistoryRequest represents a client's streams state (offsets) or a timestamp since
+// which we should return the messages for the current streams
+type HistoryRequest struct {
+	// Since is UTC timestamp in ms
+	Since int64 `json:"since,omitempty"`
+	// Streams contains the information of last offsets/epoch received for a particular stream
+	Streams map[string]HistoryPosition `json:"streams,omitempty"`
+}
+
 // Message represents incoming client message
 type Message struct {
-	Command    string      `json:"command"`
-	Identifier string      `json:"identifier"`
-	Data       interface{} `json:"data"`
+	Command    string         `json:"command"`
+	Identifier string         `json:"identifier"`
+	Data       interface{}    `json:"data"`
+	History    HistoryRequest `json:"history,omitempty"`
 }
 
 // StreamMessage represents a pub/sub message to be sent to stream
 type StreamMessage struct {
 	Stream string `json:"stream"`
 	Data   string `json:"data"`
+
+	// Offset is the position of this message in the stream
+	Offset uint64
+	// Epoch is the uniq ID of the current storage state
+	Epoch string
+}
+
+func (sm *StreamMessage) ToReplyFor(identifier string) *Reply {
+	data := sm.Data
+
+	var msg interface{}
+
+	// We ignore JSON deserialization failures and consider the message to be a string
+	json.Unmarshal([]byte(data), &msg) // nolint:errcheck
+
+	if msg == nil {
+		msg = sm.Data
+	}
+
+	stream := ""
+
+	// Only include stream if offset/epovh is present
+	if sm.Epoch != "" {
+		stream = sm.Stream
+	}
+
+	return &Reply{
+		Identifier: identifier,
+		Message:    msg,
+		StreamID:   stream,
+		Offset:     sm.Offset,
+		Epoch:      sm.Epoch,
+	}
 }
 
 // RemoteCommandMessage represents a pub/sub message with a remote command (e.g., disconnect)
@@ -211,11 +267,20 @@ func (d *DisconnectMessage) GetType() string {
 	return DisconnectType
 }
 
+func NewDisconnectMessage(reason string, reconnect bool) *DisconnectMessage {
+	return &DisconnectMessage{Type: "disconnect", Reason: reason, Reconnect: reconnect}
+}
+
 // Reply represents an outgoing client message
 type Reply struct {
 	Type       string      `json:"type,omitempty"`
-	Identifier string      `json:"identifier"`
+	Identifier string      `json:"identifier,omitempty"`
 	Message    interface{} `json:"message,omitempty"`
+	StreamID   string      `json:"stream_id,omitempty"`
+	Epoch      string      `json:"epoch,omitempty"`
+	Offset     uint64      `json:"offset,omitempty"`
+	Sid        string      `json:"sid,omitempty"`
+	Restored   bool        `json:"restored,omitempty"`
 }
 
 func (r *Reply) GetType() string {
@@ -259,6 +324,10 @@ func ConfirmationMessage(identifier string) string {
 // RejectionMessage returns a subscription rejection message for a specified identifier
 func RejectionMessage(identifier string) string {
 	return string(toJSON(Reply{Identifier: identifier, Type: RejectedType}))
+}
+
+func WelcomeMessage(sid string, restored bool) string {
+	return string(toJSON(Reply{Sid: sid, Type: WelcomeType, Restored: restored}))
 }
 
 func toJSON(msg Reply) []byte {
